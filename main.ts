@@ -1,12 +1,34 @@
-// btc-race-24h-20261118-1444 V4: selective dip + flash-wick mean-reversion bot
-// for cbBTC/USDC.
+// btc-race-24h-20261118-1444 V5: V4-A + 50/50 partial-profit lock on wick
+// trades (lock half at +85 bps, ride the rest with a LATCHED 70 bps
+// trailing stop, SL 65, max hold 480 bars).
 //
-// V4 builds on V2 (commit 88e7ee9, grade-local +$12.173642, 1 round trip) and
-// V1 (submission 01a1ef56, server dev_profitable PASS, +$9.337934). V3's
-// Bullish Regime Module is DROPPED completely — it lost money wherever it
-// fired (mirrored -$6.79) and is not present in this file in any form.
-// V4 is a fresh causal engine, not a fitted schedule: no bar indices, no
-// timestamps, no precomputed buy/sell lists anywhere in the logic.
+// DO NOT SUBMIT — strict gate FAILED. Sim (LOCAL ESTIMATE): dev +$27.46,
+// WF [18.63, 0, 8.83, 0, 0, 0] (2/6), mirrored +$0.04, sideways +$33.20,
+// whip-saw +$9.51, 2x-fee +$23.78, maxDD 0.55%. The gate needed Dev >$24,
+// Mirrored >$8, Sideways >$22, 2x-fee >$20, MaxDD <= 1.2%: mirrored fails
+// outright. AND the dev gain is a 1-bps CLIFF, not a robust edge: the
+// wick-132 ride survives a 65 bps peak drawdown, so trail 65 gives dev
+// +$18.44 while trail 66 gives +$27.46. Do not ship a 1-bps cliff.
+// Honest §1 result (trail <= 65): dev +$18.55, BELOW V4-A's +$21.09.
+// §2 depth-shock booster: DROPPED — no signal (wick-entry depth changes
+// +30/-70/-96 bps, inside the normal range; corr with forward returns
+// -0.069; the booster never triggers on dev). §3 breakout: DROPPED —
+// best variant dev +$23.13 / mirrored +$9.10-11.54 / 2x-fee +$17.04 /
+// MaxDD 1.55% (fails Dev, 2x-fee, MaxDD); it wins the mirrored spike
+// (+$6.20) then loses -$8.64 and -$10.02 on later breakouts; whip-saw
+// negative in every variant; tighter stops make it worse (MaxDD 2.35%).
+// Combinations of lock + breakout are all worse than V4-A on dev
+// (best +$13.17) with MaxDD >= 1.49%. VERDICT: KEEP V4-A (commit 74faa2e,
+// submission 01a1ef72, grade-local +$21.09) as the final live race bot.
+// This commit is the experiment record only.
+//
+// V4-A builds on V2 (commit 88e7ee9, +$12.17) and V1 (submission 01a1ef56,
+// server dev_profitable PASS, +$9.34). V3's Bullish Regime Module is
+// DROPPED completely and is not present in this file in any form.
+// No bar indices, no timestamps, no precomputed buy/sell lists anywhere
+// in the logic: the lock/trail numbers are causal exit geometry, and the
+// trail-66 cliff is reported here precisely so it is NOT mistaken for
+// an edge.
 //
 // The harness speaks agent-fun/bars-replay/v1: one hello, then one batch
 // per minute bar, then done. This bot answers every batch with exactly one
@@ -49,13 +71,10 @@
 // net(a) ~= a*(move - 0.0012) - 2*a^2/D, maximised at
 // a* = (move - 0.0012) * D / 4, where move is the expected fill-to-fill
 // move as a fraction and D the latest c_depth in USDC. 0.0012 is the
-// round-trip fee (8 bps) + slippage (4 bps). NOTE: V2's code subtracted
-// 60 bps here, not 12 — that zeroes out any trade whose take-profit is
-// <= 60 bps, which silently disabled small-TP trades. V4 fixes it to 12.
+// round-trip fee (8 bps) + slippage (4 bps).
 // With TP 110 as the move proxy a* = (0.011-0.0012)*D/4 is $1,448-$2,304
 // on dev, above the $1,000 capital, so the cap is insurance for a
 // thinner race pool (e.g. D = $200k gives a* = $490), not a dev lever.
-// For a 60 bps move a* is ~$1,008, so small-move trades size to ~full.
 //
 // Entries (two sources, either fires; dip wins the kind label when both
 // fire on the same bar):
@@ -68,7 +87,7 @@
 //     Late-window guardrail: if no position has ever been held by bar
 //     1200, the dip loosens to >= 50 bps vs the 60- or 30-bar average
 //     (insurance for a zero-trade finish; never fires on dev).
-//   WICK (new): the close sits >= 45 bps below the highest high of the
+//   WICK (V4): the close sits >= 45 bps below the highest high of the
 //     trailing 8 bars AND the current bar's low is above the previous
 //     bar's low (a higher low — the confirmation that discriminates the
 //     bottom from mid-plunge). Census of the dev window: only three
@@ -77,89 +96,59 @@
 //     -124 bps forward) or on noise. The higher-low filter is what
 //     makes the trigger work: without it the wick buys bar 61 and loses
 //     -$11.35; with it the trigger fires only on the three real events.
-//     A depth-recovery condition (c_depth rising) was tested and
-//     REJECTED: it blocks every wick trade (depth is flat) and the bot
-//     falls back to V1 alone.
 //   Cooldown 10 bars after a sell. No new buys in the final 60 bars.
 //
-// Execution — 75/25 time split (the §1 lever that actually works):
-// every entry is split into two tranches: 75% of the (depth-capped)
-// notional on the confirmation bar, the remaining 25% of cash on the
-// next bar, unconditionally. The split does two things the formula
-// predicts: (1) impact cost falls, because the two legs pay
-// 0.75^2 + 0.25^2 = 0.625 of the all-in impact; (2) the second tranche
-// fills one bar later, and a reversal-confirmation bar is very often
-// followed by one more down bar, so the blended cost basis drops —
-// which also pulls the stop-loss (measured from blended cost) further
-// away and lets marginal trades survive. Measured round-trip cost:
-// 28.8 bps all-in (V2) -> 26.1 bps (V4). A 55/45 dip-contingent
-// ladder (second tranche only if price dips another 30-45 bps) was
-// tested and REJECTED: it never fires at +45 (the plunge only dips
-// 37 bps past the first tranche) and at +30 it exits earlier and
-// worse, because the lower blended cost pulls the take-profit trigger
-// down. Smaller all-in sizes (70%/85%) were tested and REJECTED:
-// they scale profit down faster than they cut cost.
+// Execution — 75/25 time split: every entry is split into two tranches:
+// 75% of the (depth-capped) notional on the confirmation bar, the
+// remaining 25% of cash on the next bar, unconditionally. Measured
+// round-trip cost: 28.8 bps all-in (V2) -> 26.1 bps (V4).
 //
-// Exits — per-kind geometry, first trigger wins, whole position:
+// Exits — per-kind geometry, first trigger wins, whole position unless
+// the V5 wick lock fires first:
 //   DIP: take-profit +110 bps, trailing stop 50 bps below the peak
 //     close since entry (always on), hard stop-loss -75 bps, max hold
-//     60 bars. TP 100 exits the main trade at bar 81 (+$9.37); TP 110
-//     exits at the same profit on dev and better on sideways, so 110
-//     is used. TP 150 (V2) holds the main trade to bar 409 (+$12.22)
-//     but then the bot is still holding when the bar-132 wick prints,
-//     so the extra wick trade is lost — the early exit is worth more
-//     than the long hold.
+//     60 bars. (V5 lock does NOT apply to dip trades: locking the dip
+//     at +75/+80 gives dev +$13.30, worse than V4-A.)
 //   WICK: take-profit +80 bps, trailing stop 30 bps below the peak
-//     close, armed only after +50 bps unrealised profit (NOT latching:
-//     a latching trail cuts the main trade early, dev falls to +$3.17),
-//     hard stop-loss -55 bps, max hold 120 bars. TP 70 banks the
-//     bar-24 swing (+$4.64) but TP 75/80 bank slightly more on the
-//     mirrored/sideways windows; TP 60 fires too early and TP 100
-//     never fires on the +80 swing, which then rides down to its stop.
-//     The wick's +80 swing peaks at +79.6 bps, so TP 80 is the edge of
-//     what the swing offers — the trail (30 bps, armed at +50) is the
-//     exit that actually banks it when TP 80 just misses.
-//   A V3-style slow macro bull module was tried in V3 and is NOT here:
-//   its 120-bar slope gate lagged the 15-bar spike by ~560 bars.
+//     close, armed only after +50 bps unrealised profit (NOT latching),
+//     hard stop-loss -55 bps, max hold 120 bars — UNLESS the V5 lock
+//     fires first: at +85 bps unrealised, sell HALF the position and
+//     ride the rest with a LATCHED 70 bps trailing stop (latched because
+//     the lock itself proves +85 was reached; a re-checked arm lets the
+//     trail disarm exactly when it is needed and the ride half rides
+//     down to its stop), stop-loss -65 bps, max hold 480 bars. The
+//     wick-132 ride then survives to bar 508 (+276 bps); the wick-24
+//     ride exits at +40. Lock 85 / trail 40-65 on the wick gives dev
+//     +$18.55-19.40 — the +$27.46 at trail >= 66 is the cliff above.
 //
 // What was tested and REJECTED (local float simulator, exact fill
-// model, validated against grade-local on V1 to +$9.3383 vs +$9.337934
-// and on V2 to +$12.17 exact):
-//   - Dynamic z-score/ATR dip-buy, Bollinger+RSI(7), momentum
-//     breakout, trend/pullback continuation, shallow-pullback grind:
-//     all negative on dev and mirrored (see V2/V3 reports).
-//   - Wick without the higher-low filter: buys bar 61 mid-plunge,
-//     -$11.35; wick window 5 bars instead of 8: misses bar 132,
-//     dev falls to +$10.31; wick window 12: more false positives.
-//   - Ladder (55/45 dip-add), smaller all-in sizes, latching trail,
-//     depth-recovery filter, end-of-window force-close: all worse
-//     (see tournament report).
+// model, validated against grade-local on V1 to +$9.3383 vs +$9.337934,
+// on V2 to +$12.17 exact, on V4-A to +$21.09 exact):
+//   - Partial locks at +75/+80 on dip+wick or wick-only with ride
+//     trails 35-60: dev +$2.55-19.40, all below V4-A.
+//   - Pure asymmetric trailing (no lock, armed @+75, trails 35-100,
+//     latching or not): dev -$7.27 to +$18.75, MaxDD up to 2.58%.
+//   - Depth-shock booster (tighter SL -45 on entry-bar depth drops
+//     <= -200 bps): never triggers on dev; depth carries no signal.
+//   - Volatility-expansion breakout (ATR20/ATR120 > 1.3-1.4, break of
+//     20-bar high after a -25..-45 bps pullback, 75/25 split): best
+//     dev +$23.13 / mirrored +$9.10-11.54 / 2x-fee +$17.04 / MaxDD
+//     1.55% — fails Dev, 2x-fee and MaxDD; whip-saw negative in every
+//     variant; trend/slope filters do not separate the segment-3 win
+//     (+$7.12) from the segment-5 loss (-$5.08..-10.85); tighter stops
+//     make it worse (more stop-outs, MaxDD 2.35%).
 //
-// Verified grade-local (Node 22, --driver process --worktree, kit dev
-// window, L1 regrade reproduced byte for byte — deterministic):
-//   net PnL +$21.091082 USDC, 9 trades (3 round trips, 6 buys + 3 sells),
-//   win rate 1.000, max drawdown 0.5492267%, fees $2.425459 USDC,
-//   2x-fee net PnL +$18.646731, exposure 0.0377, 0 rejected orders.
-//   action_log_sha256 ca2a756d5061af3dfef4db20bfeb97b31ace27927bd1c158f7bedc045b1765a3
-//   result_sha256 e6ec88b193ad7aa1961b0a75134e58a1f2f0733be7495245dda72a55b8fe663d
-//   Local-estimate regime windows (float simulator, exact fill model):
-//   mirrored +$2.61, sideways +$22.18, walk-forward 6x4h
-//   [21.09, 0, 0, 0, 0, 0] — 1/6 positive, mean $3.52; V2 on the same
-//   windows: +$12.17 / 1/6 / $0.00 mirrored / +$12.85 sideways /
-//   +$11.36 at 2x fees (grade-local 2x +$10.96 — the float sim's 2x leg
-//   runs ~$0.40 low on V2, so treat the regime numbers as estimates).
-//   The three dev trades are the wick at bar 24 (+$4.64), the dip at
-//   bar 66 (+$9.37) and the wick at bar 132 (+$5.08) — every tradeable
-//   event the window contains. The +$20-45 target in the brief is not
-//   fully reachable: the window's gross up-swings total 903 bps and
-//   the perfect-foresight ceiling is +$63.65, but only three causal
-//   events clear costs; V4 captures all three. DO NOT SUBMIT on this
-//   evidence alone — the parent agent decides.
+// Grade-local for this V5 file is run by the parent agent; the float
+// simulator's prediction is net PnL +$27.46 USDC (LOCAL ESTIMATE) with
+// the cliff caveat above. V4-A's verified grade-local remains
+// +$21.091082 USDC, 9 trades (3 round trips), win rate 1.000,
+// max drawdown 0.5492267%, fees $2.425459, 2x-fee +$18.646731.
+// DO NOT SUBMIT this file on the +$27.46 number alone.
 //
 // Everything is bigint arithmetic on raw closes, no randomness, no wall
 // clock, no network, no files: two executions on the same bars give the
 // same orders. The hello seed is accepted but unused.
-
+//
 import { runBars, type BarsState, type Batch, type OrderInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
@@ -193,6 +182,20 @@ const WICK_TRAIL_ARM_BPS = 50n; // trailing activates only above this profit
 const WICK_TRAIL_BPS = 30n;
 const WICK_STOP_LOSS_BPS = 55n;
 const WICK_MAX_HOLD_BARS = 120;
+
+// V5 partial-profit lock (wick trades only): at +85 bps unrealised profit
+// sell HALF the position and ride the rest with a LATCHED 70 bps trailing
+// stop, stop-loss -65 bps, max hold 480 bars. The lock is checked BEFORE
+// the normal exits (at up >= 85 the wick TP 80 would otherwise fire
+// first). The trail is latched — the lock itself proves +85 was reached;
+// a re-checked arm disarms the trail exactly when it is needed and the
+// ride half rides down to its stop. See the header: the +$27.46 dev
+// number this produces is a 1-bps cliff (trail 65 -> +$18.44), not an
+// edge, and the mirrored leg fails the gate (+$0.04). DO NOT SUBMIT.
+const LOCK_BPS = 85n;
+const RIDE_TRAIL_BPS = 70n;
+const RIDE_STOP_LOSS_BPS = 65n;
+const RIDE_MAX_HOLD_BARS = 480;
 
 const COOLDOWN_BARS = 10;
 
@@ -298,6 +301,10 @@ class WickDipTrader {
   private heldBars = 0;
   private kind: EntryKind | null = null;
   private splitArmed = false;
+  // V5 lock state: lockDone once the partial lock has fired for this
+  // position; rideMode while the remaining half is being ridden.
+  private lockDone = false;
+  private rideMode = false;
 
   onBatch(state: BarsState, batch: Batch): OrderInput[] {
     const bar = batch.bars.find((b) => b.symbol === SYMBOL);
@@ -370,6 +377,8 @@ class WickDipTrader {
     this.heldBars = 0;
     this.kind = null;
     this.splitArmed = false;
+    this.lockDone = false;
+    this.rideMode = false;
   }
 
   /** Whole-position exits (first trigger wins) and the split 2nd tranche. */
@@ -382,16 +391,31 @@ class WickDipTrader {
     const down = ((entry - close) * BPS) / entry;
     const offPeak = ((peak - close) * BPS) / peak;
     const isWick = this.kind === 'wick';
+    // V5 partial-profit lock, checked BEFORE the normal exits: at +85 bps
+    // on a wick trade, sell half the position and ride the rest.
+    if (isWick && !this.lockDone && up >= LOCK_BPS) {
+      this.lockDone = true;
+      this.rideMode = true;
+      const half = qty / 2n;
+      if (half > 0n) {
+        return [{ side: 'sell', symbol: SYMBOL, qty: half, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+      }
+    }
+    // In ride mode the take-profit is disabled (the trail is the exit)
+    // and the trail is LATCHED; otherwise the per-kind geometry applies.
+    const isRide = this.rideMode;
     const tp = isWick ? WICK_TAKE_PROFIT_BPS : DIP_TAKE_PROFIT_BPS;
-    const trail = isWick ? WICK_TRAIL_BPS : DIP_TRAIL_BPS;
+    const trail = isRide ? RIDE_TRAIL_BPS : isWick ? WICK_TRAIL_BPS : DIP_TRAIL_BPS;
     const arm = isWick ? WICK_TRAIL_ARM_BPS : DIP_TRAIL_ARM_BPS;
-    const sl = isWick ? WICK_STOP_LOSS_BPS : DIP_STOP_LOSS_BPS;
-    const maxHold = isWick ? WICK_MAX_HOLD_BARS : DIP_MAX_HOLD_BARS;
+    const sl = isRide ? RIDE_STOP_LOSS_BPS : isWick ? WICK_STOP_LOSS_BPS : DIP_STOP_LOSS_BPS;
+    const maxHold = isRide ? RIDE_MAX_HOLD_BARS : isWick ? WICK_MAX_HOLD_BARS : DIP_MAX_HOLD_BARS;
     // Trailing stop is armed only while unrealised profit is above the
-    // arm level (NOT latching: latching cuts the dip trade early).
-    const trailArmed = up >= arm;
+    // arm level (NOT latching: latching cuts the dip trade early) —
+    // except in ride mode, where the lock already proved the arm.
+    const trailArmed = isRide ? true : up >= arm;
+    const tpHit = !isRide && up >= tp;
     const done =
-      up >= tp || down >= sl || (trailArmed && offPeak >= trail) || this.heldBars >= maxHold;
+      tpHit || down >= sl || (trailArmed && offPeak >= trail) || this.heldBars >= maxHold;
     if (done) {
       this.cooldownLeft = COOLDOWN_BARS;
       this.splitArmed = false;
