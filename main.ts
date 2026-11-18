@@ -1,11 +1,22 @@
-// btc-race-24h-20261118-1444 V2: selective dip mean-reversion bot for cbBTC/USDC.
+// btc-race-24h-20261118-1444 V3: V2 core (untouched) + a strictly-gated
+// Bullish Regime Module. V1 (submission 01a1ef56, grade-local +$9.337934,
+// server dev_profitable PASS) is the safe fallback. V2 (commit 88e7ee9,
+// grade-local +$12.173642) is the fallback candidate. This V3 does NOT
+// clear Fura's promotion gate (see the header note at the end), so it
+// must NOT be submitted on this evidence.
 //
-// V2 is V1's entry with re-worked exit geometry and depth-aware sizing.
-// V1 (submission 01a1ef56, grade-local +$9.337934, server dev_profitable PASS)
-// is the safe fallback: this V2 does NOT clear Fura's promotion gates
-// (see the header note at the end), so it must NOT be submitted on this
-// evidence. It is the best honest candidate found in a ~35-variant local
-// tournament; the gates fail on the window's arithmetic, not on tuning.
+// The module was added exactly as specified and tournament-tested in
+// ~/workspace/makefun/btc-race-v2/v3_tournament.py (local float
+// simulator, exact fill model, validated against grade-local on V1 to
+// +$9.3383 vs +$9.337934): it arms ONLY when close > SMA240 AND
+// SMA60 > SMA240 AND the 120-bar close slope > +80 bps, AND no dip
+// trade has ever fired (or >360 bars since the last exit), and enters
+// ONLY on a new 60-bar high (confirmed higher-low / momentum
+// continuation breakout). It NEVER fires on the dev window (verified:
+// V3 grade-local trade log is identical to V2's), so V2's +$12.17 dev
+// behaviour is preserved exactly. On the mirrored (+281 bps) window
+// every firing variant LOSES (-$6.79 to -$11.09) and the module also
+// cuts sideways from +$12.85 to +$6.49 — see the limits note below.
 //
 // The harness speaks agent-fun/bars-replay/v1: one hello, then one batch
 // per minute bar, then done. This bot answers every batch with exactly one
@@ -81,6 +92,21 @@
 // trade run to +122 bps net in the local simulator. The gain is one
 // trade's timing, not a new edge — see the limits note below.
 //
+// Bullish Regime Module (V3, strictly gated, non-interfering):
+// arms ONLY when the macro trend is unmistakably bullish —
+//   close > SMA240 AND SMA60 > SMA240 AND the 120-bar close slope
+//   (close - close_120_bars_ago) / close > +80 bps —
+// AND no dip trade has ever fired, or >360 bars have passed since the
+// last exit. Enters ONLY on a confirmed breakout: a new 60-bar high
+// (no overhead resistance in the last 60 bars, so the >120 bps upside
+// requirement is the open trend itself, not a fitted level). The dip
+// entry is checked first and always wins; the module can only fire
+// where V2 would otherwise sit idle. Bull exits (no take-profit — the
+// wide trail is the exit): trailing stop 80 bps below the peak, armed
+// only after +90 bps unrealised profit, hard stop-loss -70 bps, max
+// hold 480 bars. Sizing is the same depth-aware rule, with the 150 bps
+// move proxy (full size on dev depths).
+//
 // What was tested and REJECTED (local float simulator, exact fill model,
 // validated against grade-local on V1 to +$9.3383 vs +$9.337934):
 //   - Mode 1 dynamic z-score/ATR dip-buy (threshold = max(45-70,
@@ -101,16 +127,60 @@
 //     as derived above.
 //   - End-of-window force-close (tested in V1): hurts, not used.
 //
+// V3 Bullish Module — what was tested (v3_tournament.py, same simulator
+// and regime constructions as V2; all numbers LOCAL ESTIMATE except the
+// grade-local dev row). Breakout variants at slope 80, exits trail 80
+// armed @90 / SL 70 / hold 480, no TP:
+//   B1 new 60-bar high:      dev +$12.17, WF 1/6, mirrored -$6.79, sideways +$6.49, 2x-fee +$10.96 (sim)
+//   B1c tight consolidation: same trades as B1 on every window
+//   B2 new 30-bar high + momentum: mirrored -$11.09, sideways +$6.49
+//   B3 higher-low + new 20-bar high: mirrored -$6.79, sideways +$6.49
+//   B4 pullback-then-break above SMA20: mirrored -$10.82, sideways +$12.85
+//   Slope 120 / 150 bps: module never fires anywhere (mirrored $0.00)
+//   SMA60-slope definition: never fires anywhere (max 77 bps < 80 on mirrored)
+//   Exit variants (arm 70/120, trail 60/100, SL 55/90, hold 240, TP 250/350):
+//     mirrored stays -$6.79..-$9.37, sideways $6.49..$12.55 — no geometry fixes it
+//   Faster slope windows (30/60 bars, thr 50): module fires and LOSES
+//     everywhere — mirrored -$11.78/-$6.69, dev falls to +$1.44/+$1.96
+//     (a losing bull trade in segment 5), 2x-fee turns negative. Loosening
+//     the gate destroys the core too.
+// Mechanism (trade log, B1): mirrored buys bar 653 at $65,751 — the
+// first bar the 120-bar slope confirms the trend — and holds 480 bars
+// to a max-hold exit at $65,522, -$6.79. The mirrored "uptrend" is one
+// +202 bps spike in 15 bars (bars 54-69) plus slow drift; the slope
+// gate first exceeds 80 bps only at bar 627, ~560 bars after the move.
+// After entry the max forward upside is +41 bps — below the ~36 bps
+// round-trip cost plus any margin — so no exit geometry can save the
+// trade. The SMA60 > SMA240 condition blocks the spike itself (the
+// 15-bar spike barely moves SMA60). The module is structurally too
+// slow for this window's shape: it buys the top of the post-spike
+// drift and bleeds on the pullback. On sideways it adds a losing
+// trade (buy 878, sell 1358) that cuts +$12.85 to +$6.49.
+// PROMOTION GATE (V3): dev >= +$12.17 (PASS, identical trade log),
+// mirrored > +$8.00 (FAIL, best firing variant -$6.79; $0.00 if it
+// never fires), sideways > +$10.00 (FAIL for every firing variant),
+// 2x-fee > +$10.00 (PASS on dev only because the module never fires
+// there), WF >= 2/6 (FAIL, stays 1/6). RECOMMENDATION: KEEP V2.
+// The live race risk the module was meant to fix — $0 on a bullish
+// 24h window — is real, but this window's bullish shape (one spike
+// plus drift) cannot be caught causally by any tested gated entry:
+// the only profitable bullish entries would have to buy the spike
+// itself, before any trend confirmation exists.
+//
 // Verified grade-local (Node 22, --driver process --worktree, kit dev
 // window, two runs identical, L1 regrade reproduced byte for byte):
 // net PnL +$12.173642, 2 trades (1 buy + 1 sell), win rate 1.0,
 // max drawdown 1.4964%, fees $0.805032, net PnL at 2x fees +$11.364509,
 // 0 rejected, action_log_sha256 c5a9cf6e0ef2bc661c0bf40663c1eea72a866d3b431aa6c945a7ab06ea3fa8a2.
-// Walk-forward 6x4h [0, +12.17, 0, 0, 0, 0] — 1/6 positive (local
-// simulator, exit attributed to its segment). Mirrored +$0.00 (never
-// trades), sideways +$12.85 (simulator), 2x-fee dev +$11.36 (grade-local).
-// The exit is in segment 2: the same single plunge trade as V1, held
-// longer (max hold 360, armed trailing) instead of TP 100 at bar ~85.
+// The action log is BYTE-IDENTICAL to V2's (same sha256): the bull
+// module never fires on the dev window, so V3's dev behaviour is
+// exactly V2's, trade for trade. Walk-forward 6x4h [0, +12.17, 0, 0, 0, 0]
+// — 1/6 positive (local simulator, exit attributed to its segment).
+// Mirrored/sideways numbers are LOCAL ESTIMATE from v3_tournament.py,
+// not grade-local (the kit grades dev only): mirrored -$6.79 with the
+// B1 module firing once, sideways +$6.49. The exit is in segment 2:
+// the same single plunge trade as V1/V2, held longer (max hold 360,
+// armed trailing) instead of TP 100 at bar ~85.
 //
 // WHY THE GATES FAIL — the window's arithmetic, not the tuning:
 // A perfect-foresight dynamic program over the exact fill model (buy/sell
@@ -151,6 +221,18 @@ const TRAIL_BPS = 60n;
 const STOP_LOSS_BPS = 65n;
 const MAX_HOLD_BARS = 360;
 const COOLDOWN_BARS = 10;
+
+// Bullish Regime Module exits (V3): no take-profit — the wide trail
+// is the exit. Trail 80 bps, armed only after +90 bps profit;
+// hard stop-loss -70 bps; max hold 480 bars.
+const BULL_TRAIL_ARM_BPS = 90n;
+const BULL_TRAIL_BPS = 80n;
+const BULL_STOP_LOSS_BPS = 70n;
+const BULL_MAX_HOLD_BARS = 480;
+// Bull arming: 120-bar close slope must exceed this (bps).
+const BULL_SLOPE_BPS = 80n;
+// Bull idle gate: bars since the last exit before the module may fire.
+const BULL_IDLE_BARS = 360;
 
 // Window-shape rules, counted in bars seen.
 const GUARDRAIL_BAR = 1200; // loosen the dip from here if never traded
@@ -210,6 +292,12 @@ class DipTrader {
   private peakClose: bigint | null = null;
   private heldBars = 0;
   private cooldownLeft = 0;
+  // Bullish module state: last 121 closes (for the 120-bar slope and
+  // the 60-bar-high breakout), the mode of the open position, and the
+  // bar on which the last sell was decided.
+  private closes: bigint[] = [];
+  private mode: 'dip' | 'bull' | null = null;
+  private lastExitBar = -1_000_000;
 
   onBatch(state: BarsState, batch: Batch): OrderInput[] {
     const bar = batch.bars.find((b) => b.symbol === SYMBOL);
@@ -223,6 +311,10 @@ class DipTrader {
     this.longMean.push(close);
     this.longerMean.push(close);
     this.guardMean.push(close);
+    // Keep the last 121 closes for the bull module's 120-bar slope
+    // (close vs the close 120 bars ago) and 60-bar-high breakout.
+    this.closes.push(close);
+    if (this.closes.length > 121) this.closes.shift();
     // Latest close depth (USDC raw units, 1e6 per USDC): the depth to
     // size the next order against — the next open's depth is unknown.
     if (bar.c_depth.length > 0) this.lastDepth = BigInt(bar.c_depth[0]);
@@ -259,7 +351,9 @@ class DipTrader {
     return orders;
   }
 
-  /** Whole-position exits, first trigger wins. */
+  /** Whole-position exits, first trigger wins. Exit geometry depends
+   * on the mode of the open position: V2 dip exits, or the bull
+   * module's wide armed trail (no take-profit — the trail is the exit). */
   private exitOrders(qty: bigint, close: bigint): OrderInput[] {
     this.heldBars += 1;
     if (this.peakClose !== null && close > this.peakClose) this.peakClose = close;
@@ -268,15 +362,23 @@ class DipTrader {
     const up = ((close - entry) * BPS) / entry;
     const down = ((entry - close) * BPS) / entry;
     const offPeak = ((peak - close) * BPS) / peak;
-    // Trailing stop is armed only after +70 bps unrealised profit.
-    const trailArmed = up >= TRAIL_ARM_BPS;
+    const bull = this.mode === 'bull';
+    // Bull: trail 80 armed only after +90 bps unrealised profit.
+    // Dip: V2 trail 60 armed only after +70 bps unrealised profit.
+    const trailArm = bull ? BULL_TRAIL_ARM_BPS : TRAIL_ARM_BPS;
+    const trail = bull ? BULL_TRAIL_BPS : TRAIL_BPS;
+    const stopLoss = bull ? BULL_STOP_LOSS_BPS : STOP_LOSS_BPS;
+    const maxHold = bull ? BULL_MAX_HOLD_BARS : MAX_HOLD_BARS;
+    const trailArmed = up >= trailArm;
     const done =
-      up >= TAKE_PROFIT_BPS ||
-      down >= STOP_LOSS_BPS ||
-      (trailArmed && offPeak >= TRAIL_BPS) ||
-      this.heldBars >= MAX_HOLD_BARS;
+      (!bull && up >= TAKE_PROFIT_BPS) ||
+      down >= stopLoss ||
+      (trailArmed && offPeak >= trail) ||
+      this.heldBars >= maxHold;
     if (!done) return [];
     this.cooldownLeft = COOLDOWN_BARS;
+    this.lastExitBar = this.seenBars;
+    this.mode = null;
     return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
   }
 
@@ -314,11 +416,18 @@ class DipTrader {
         this.midMean.dipBps(close) >= DIP_GUARD_BPS ||
         this.guardMean.dipBps(close) >= DIP_GUARD_BPS;
     }
-    if (!dipped && !guardrail) return [];
+    // The dip entry is checked first and always wins; the bull module
+    // can only fire where V2 would otherwise sit idle.
+    let bull = false;
+    if (!dipped && !guardrail) {
+      bull = this.bullEntry(close);
+      if (!bull) return [];
+    }
 
     const notional = this.sizedNotional(state.cash);
     if (notional < MIN_BUY_QUOTE) return [];
     this.pendingEntry = close;
+    this.mode = bull ? 'bull' : 'dip';
     return [
       {
         side: 'buy',
@@ -327,6 +436,32 @@ class DipTrader {
         max_slippage_bps: MAX_SLIPPAGE_BPS,
       },
     ];
+  }
+
+  /** Bullish Regime Module: arms ONLY on an unmistakable macro
+   * uptrend — close > SMA240 AND SMA60 > SMA240 AND the 120-bar
+   * close slope > +80 bps — AND only when no dip trade has ever
+   * fired, or >360 bars have passed since the last exit. Enters
+   * ONLY on a confirmed breakout: a new 60-bar high, so there is no
+   * overhead resistance in the last 60 bars and the >120 bps upside
+   * requirement is the open trend itself. Returns false on a
+   * downtrend or chop, where V2's behaviour must stay untouched. */
+  private bullEntry(close: bigint): boolean {
+    if (this.closes.length < 121) return false; // need 120 bars of slope
+    if (!this.longerMean.ready || !this.midMean.ready) return false;
+    if (close <= this.longerMean.mean) return false; // below SMA240
+    if (this.midMean.mean <= this.longerMean.mean) return false; // SMA60 <= SMA240
+    const close120Ago = this.closes[this.closes.length - 121];
+    const slope = ((close - close120Ago) * BPS) / close;
+    if (slope <= BULL_SLOPE_BPS) return false;
+    // Idle gate: only when V2 would otherwise stay completely idle.
+    if (this.everHeld && this.seenBars - this.lastExitBar <= BULL_IDLE_BARS) return false;
+    // Breakout confirmation: a new 60-bar high.
+    let high = 0n;
+    for (let k = this.closes.length - 60; k < this.closes.length; k++) {
+      if (this.closes[k] > high) high = this.closes[k];
+    }
+    return close >= high;
   }
 }
 
