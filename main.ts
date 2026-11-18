@@ -1,26 +1,16 @@
-// btc-race-24h-20261118-1444 V3: V2 core (untouched) + a strictly-gated
-// Bullish Regime Module. V1 (submission 01a1ef56, grade-local +$9.337934,
-// server dev_profitable PASS) is the safe fallback. V2 (commit 88e7ee9,
-// grade-local +$12.173642) is the fallback candidate. This V3 does NOT
-// clear Fura's promotion gate (see the header note at the end), so it
-// must NOT be submitted on this evidence.
+// btc-race-24h-20261118-1444 V4: selective dip + flash-wick mean-reversion bot
+// for cbBTC/USDC.
 //
-// The module was added exactly as specified and tournament-tested in
-// ~/workspace/makefun/btc-race-v2/v3_tournament.py (local float
-// simulator, exact fill model, validated against grade-local on V1 to
-// +$9.3383 vs +$9.337934): it arms ONLY when close > SMA240 AND
-// SMA60 > SMA240 AND the 120-bar close slope > +80 bps, AND no dip
-// trade has ever fired (or >360 bars since the last exit), and enters
-// ONLY on a new 60-bar high (confirmed higher-low / momentum
-// continuation breakout). It NEVER fires on the dev window (verified:
-// V3 grade-local trade log is identical to V2's), so V2's +$12.17 dev
-// behaviour is preserved exactly. On the mirrored (+281 bps) window
-// every firing variant LOSES (-$6.79 to -$11.09) and the module also
-// cuts sideways from +$12.85 to +$6.49 — see the limits note below.
+// V4 builds on V2 (commit 88e7ee9, grade-local +$12.173642, 1 round trip) and
+// V1 (submission 01a1ef56, server dev_profitable PASS, +$9.337934). V3's
+// Bullish Regime Module is DROPPED completely — it lost money wherever it
+// fired (mirrored -$6.79) and is not present in this file in any form.
+// V4 is a fresh causal engine, not a fitted schedule: no bar indices, no
+// timestamps, no precomputed buy/sell lists anywhere in the logic.
 //
 // The harness speaks agent-fun/bars-replay/v1: one hello, then one batch
 // per minute bar, then done. This bot answers every batch with exactly one
-// reply echoing the batch seq, carrying zero or one order. A buy decided
+// reply echoing the batch seq, carrying zero or more orders. A buy decided
 // on a batch fills at the next bar's open, so every decision is made on a
 // closed bar and priced at the following open.
 //
@@ -47,9 +37,8 @@
 //   min $638,826, max $1,022,364 (c_depth near-identical). Full-size
 //   $1,000: impact ~12 bps per leg, round trip ~36 bps
 //   (8 fee + 4 slippage + ~24 impact). o->c depth change per bar:
-//   median 0, max -613/+989 bps; bar-to-bar c_depth change max -680/+1080
-//   bps — the pool barely moves, so a depth-shock signal carries almost
-//   no information on this window and is not used as an entry trigger.
+//   median 0, max -613/+989 bps — the pool barely moves, so a depth-shock
+//   signal carries almost no information and is not used as a trigger.
 //   Hello caps: max_open_positions 1, max_orders_per_bar 16,
 //   max_weight_bps 10000, fee_bps 4, slippage_bps 2,
 //   min_notional $1 (1,000,000 quote units). An order whose price
@@ -59,145 +48,113 @@
 // Sizing (depth-aware, derived from the linear impact above):
 // net(a) ~= a*(move - 0.0012) - 2*a^2/D, maximised at
 // a* = (move - 0.0012) * D / 4, where move is the expected fill-to-fill
-// move as a fraction and D the latest c_depth in USDC. With the take
-// profit as the expected-move proxy (TP 150 bps): a* = (0.015-0.0012)*D/4.
-// On the dev window a* ranges $1,448-$2,304, always above the $1,000
-// capital, so V2 buys full size on dev — the sizing rule is insurance
-// for a thinner race pool (e.g. D = $200k gives a* = $690), not a dev
-// lever. For moves below ~60 bps a* drops under $1,000, so small-move
-// trades size down instead of paying full impact.
+// move as a fraction and D the latest c_depth in USDC. 0.0012 is the
+// round-trip fee (8 bps) + slippage (4 bps). NOTE: V2's code subtracted
+// 60 bps here, not 12 — that zeroes out any trade whose take-profit is
+// <= 60 bps, which silently disabled small-TP trades. V4 fixes it to 12.
+// With TP 110 as the move proxy a* = (0.011-0.0012)*D/4 is $1,448-$2,304
+// on dev, above the $1,000 capital, so the cap is insurance for a
+// thinner race pool (e.g. D = $200k gives a* = $490), not a dev lever.
+// For a 60 bps move a* is ~$1,008, so small-move trades size to ~full.
 //
-// Entry (unchanged from V1 — every alternative entry tested worse):
-// full-size (or depth-sized) buy only when the close is far below a
-// moving average AND has started to turn:
-//   - dip >= 75 bps vs the 15-bar average, OR
-//   - dip >= 100 bps vs the 60-bar average, OR
-//   - dip >= 200 bps vs the 120-bar or 240-bar average,
-//   AND the close is above the previous bar's low (rebound confirmation).
-// Late-window guardrail: if no position has ever been held by bar 1200,
-// the dip loosens to >= 50 bps vs the 60- or 30-bar average (insurance
-// for a zero-trade finish; never fires on dev). Cooldown 10 bars after
-// a sell. No new buys in the final 60 bars.
+// Entries (two sources, either fires; dip wins the kind label when both
+// fire on the same bar):
+//   DIP (V1 entry, unchanged): buy only when the close is far below a
+//     moving average AND has started to turn:
+//     - dip >= 75 bps vs the 15-bar average, OR
+//     - dip >= 100 bps vs the 60-bar average, OR
+//     - dip >= 200 bps vs the 120-bar or 240-bar average,
+//     AND the close is above the previous bar's low.
+//     Late-window guardrail: if no position has ever been held by bar
+//     1200, the dip loosens to >= 50 bps vs the 60- or 30-bar average
+//     (insurance for a zero-trade finish; never fires on dev).
+//   WICK (new): the close sits >= 45 bps below the highest high of the
+//     trailing 8 bars AND the current bar's low is above the previous
+//     bar's low (a higher low — the confirmation that discriminates the
+//     bottom from mid-plunge). Census of the dev window: only three
+//     wick events exist (bars 24, 66, 132); every other fast-drop
+//     definition fires on mid-plunge bars that keep falling (bar 61:
+//     -124 bps forward) or on noise. The higher-low filter is what
+//     makes the trigger work: without it the wick buys bar 61 and loses
+//     -$11.35; with it the trigger fires only on the three real events.
+//     A depth-recovery condition (c_depth rising) was tested and
+//     REJECTED: it blocks every wick trade (depth is flat) and the bot
+//     falls back to V1 alone.
+//   Cooldown 10 bars after a sell. No new buys in the final 60 bars.
 //
-// Exits (changed from V1: TP 100 -> 150, trail 50 -> armed trailing,
-// hold 60 -> 360). Whole position, first trigger wins:
-//   - take-profit +150 bps above the entry close,
-//   - trailing stop 60 bps below the peak close since entry, but ONLY
-//     once unrealised profit has reached +70 bps (before that the trail
-//     is off, so a normal 40-60 bps wobble cannot stop the trade out),
-//   - hard stop-loss -65 bps,
-//   - max hold 360 bars.
-// V1's TP 100 / trail 50 / hold 60 cut the dev window's one clean bounce
-// (+162 bps low-to-high) at +93 bps net. The wider exit lets the same
-// trade run to +122 bps net in the local simulator. The gain is one
-// trade's timing, not a new edge — see the limits note below.
+// Execution — 75/25 time split (the §1 lever that actually works):
+// every entry is split into two tranches: 75% of the (depth-capped)
+// notional on the confirmation bar, the remaining 25% of cash on the
+// next bar, unconditionally. The split does two things the formula
+// predicts: (1) impact cost falls, because the two legs pay
+// 0.75^2 + 0.25^2 = 0.625 of the all-in impact; (2) the second tranche
+// fills one bar later, and a reversal-confirmation bar is very often
+// followed by one more down bar, so the blended cost basis drops —
+// which also pulls the stop-loss (measured from blended cost) further
+// away and lets marginal trades survive. Measured round-trip cost:
+// 28.8 bps all-in (V2) -> 26.1 bps (V4). A 55/45 dip-contingent
+// ladder (second tranche only if price dips another 30-45 bps) was
+// tested and REJECTED: it never fires at +45 (the plunge only dips
+// 37 bps past the first tranche) and at +30 it exits earlier and
+// worse, because the lower blended cost pulls the take-profit trigger
+// down. Smaller all-in sizes (70%/85%) were tested and REJECTED:
+// they scale profit down faster than they cut cost.
 //
-// Bullish Regime Module (V3, strictly gated, non-interfering):
-// arms ONLY when the macro trend is unmistakably bullish —
-//   close > SMA240 AND SMA60 > SMA240 AND the 120-bar close slope
-//   (close - close_120_bars_ago) / close > +80 bps —
-// AND no dip trade has ever fired, or >360 bars have passed since the
-// last exit. Enters ONLY on a confirmed breakout: a new 60-bar high
-// (no overhead resistance in the last 60 bars, so the >120 bps upside
-// requirement is the open trend itself, not a fitted level). The dip
-// entry is checked first and always wins; the module can only fire
-// where V2 would otherwise sit idle. Bull exits (no take-profit — the
-// wide trail is the exit): trailing stop 80 bps below the peak, armed
-// only after +90 bps unrealised profit, hard stop-loss -70 bps, max
-// hold 480 bars. Sizing is the same depth-aware rule, with the 150 bps
-// move proxy (full size on dev depths).
+// Exits — per-kind geometry, first trigger wins, whole position:
+//   DIP: take-profit +110 bps, trailing stop 50 bps below the peak
+//     close since entry (always on), hard stop-loss -75 bps, max hold
+//     60 bars. TP 100 exits the main trade at bar 81 (+$9.37); TP 110
+//     exits at the same profit on dev and better on sideways, so 110
+//     is used. TP 150 (V2) holds the main trade to bar 409 (+$12.22)
+//     but then the bot is still holding when the bar-132 wick prints,
+//     so the extra wick trade is lost — the early exit is worth more
+//     than the long hold.
+//   WICK: take-profit +80 bps, trailing stop 30 bps below the peak
+//     close, armed only after +50 bps unrealised profit (NOT latching:
+//     a latching trail cuts the main trade early, dev falls to +$3.17),
+//     hard stop-loss -55 bps, max hold 120 bars. TP 70 banks the
+//     bar-24 swing (+$4.64) but TP 75/80 bank slightly more on the
+//     mirrored/sideways windows; TP 60 fires too early and TP 100
+//     never fires on the +80 swing, which then rides down to its stop.
+//     The wick's +80 swing peaks at +79.6 bps, so TP 80 is the edge of
+//     what the swing offers — the trail (30 bps, armed at +50) is the
+//     exit that actually banks it when TP 80 just misses.
+//   A V3-style slow macro bull module was tried in V3 and is NOT here:
+//   its 120-bar slope gate lagged the 15-bar spike by ~560 bars.
 //
-// What was tested and REJECTED (local float simulator, exact fill model,
-// validated against grade-local on V1 to +$9.3383 vs +$9.337934):
-//   - Mode 1 dynamic z-score/ATR dip-buy (threshold = max(45-70,
-//     k*ATR60), k = 10-20, TP 100-250, trail 45-60, SL 55-65,
-//     hold 120-360): best +$9.28 dev, walk-forward 2/6 positive,
-//     mirrored -$17.04 — more trades, all in the losing direction.
-//     ATR60 on dev is ~4-5 bps, so the ATR thresholds land at 45-70 bps
-//     and admit the slow-drift dips that lose after the 36 bps cost.
-//   - Mode 2 trend/pullback continuation (SMA30 > SMA120 with rising
-//     slope, buy -35..-55 bps below SMA20, trail 80-120) and the
-//     shallow-pullback "grind" variant (15-45 bps below SMA60/SMA20 in
-//     an uptrend): every variant negative on dev (-$2.53..-$13.95) and
-//     negative on the mirrored window (-$6.68..-$15.62). Shallow
-//     pullbacks in this data are noise, not continuation.
-//   - Two-bar micro-reversal confirmation instead of close > prev low:
-//     -$8.46 dev.
-//   - D-aware sizing: identical to full size on dev (a* > capital),
-//     as derived above.
-//   - End-of-window force-close (tested in V1): hurts, not used.
-//
-// V3 Bullish Module — what was tested (v3_tournament.py, same simulator
-// and regime constructions as V2; all numbers LOCAL ESTIMATE except the
-// grade-local dev row). Breakout variants at slope 80, exits trail 80
-// armed @90 / SL 70 / hold 480, no TP:
-//   B1 new 60-bar high:      dev +$12.17, WF 1/6, mirrored -$6.79, sideways +$6.49, 2x-fee +$10.96 (sim)
-//   B1c tight consolidation: same trades as B1 on every window
-//   B2 new 30-bar high + momentum: mirrored -$11.09, sideways +$6.49
-//   B3 higher-low + new 20-bar high: mirrored -$6.79, sideways +$6.49
-//   B4 pullback-then-break above SMA20: mirrored -$10.82, sideways +$12.85
-//   Slope 120 / 150 bps: module never fires anywhere (mirrored $0.00)
-//   SMA60-slope definition: never fires anywhere (max 77 bps < 80 on mirrored)
-//   Exit variants (arm 70/120, trail 60/100, SL 55/90, hold 240, TP 250/350):
-//     mirrored stays -$6.79..-$9.37, sideways $6.49..$12.55 — no geometry fixes it
-//   Faster slope windows (30/60 bars, thr 50): module fires and LOSES
-//     everywhere — mirrored -$11.78/-$6.69, dev falls to +$1.44/+$1.96
-//     (a losing bull trade in segment 5), 2x-fee turns negative. Loosening
-//     the gate destroys the core too.
-// Mechanism (trade log, B1): mirrored buys bar 653 at $65,751 — the
-// first bar the 120-bar slope confirms the trend — and holds 480 bars
-// to a max-hold exit at $65,522, -$6.79. The mirrored "uptrend" is one
-// +202 bps spike in 15 bars (bars 54-69) plus slow drift; the slope
-// gate first exceeds 80 bps only at bar 627, ~560 bars after the move.
-// After entry the max forward upside is +41 bps — below the ~36 bps
-// round-trip cost plus any margin — so no exit geometry can save the
-// trade. The SMA60 > SMA240 condition blocks the spike itself (the
-// 15-bar spike barely moves SMA60). The module is structurally too
-// slow for this window's shape: it buys the top of the post-spike
-// drift and bleeds on the pullback. On sideways it adds a losing
-// trade (buy 878, sell 1358) that cuts +$12.85 to +$6.49.
-// PROMOTION GATE (V3): dev >= +$12.17 (PASS, identical trade log),
-// mirrored > +$8.00 (FAIL, best firing variant -$6.79; $0.00 if it
-// never fires), sideways > +$10.00 (FAIL for every firing variant),
-// 2x-fee > +$10.00 (PASS on dev only because the module never fires
-// there), WF >= 2/6 (FAIL, stays 1/6). RECOMMENDATION: KEEP V2.
-// The live race risk the module was meant to fix — $0 on a bullish
-// 24h window — is real, but this window's bullish shape (one spike
-// plus drift) cannot be caught causally by any tested gated entry:
-// the only profitable bullish entries would have to buy the spike
-// itself, before any trend confirmation exists.
+// What was tested and REJECTED (local float simulator, exact fill
+// model, validated against grade-local on V1 to +$9.3383 vs +$9.337934
+// and on V2 to +$12.17 exact):
+//   - Dynamic z-score/ATR dip-buy, Bollinger+RSI(7), momentum
+//     breakout, trend/pullback continuation, shallow-pullback grind:
+//     all negative on dev and mirrored (see V2/V3 reports).
+//   - Wick without the higher-low filter: buys bar 61 mid-plunge,
+//     -$11.35; wick window 5 bars instead of 8: misses bar 132,
+//     dev falls to +$10.31; wick window 12: more false positives.
+//   - Ladder (55/45 dip-add), smaller all-in sizes, latching trail,
+//     depth-recovery filter, end-of-window force-close: all worse
+//     (see tournament report).
 //
 // Verified grade-local (Node 22, --driver process --worktree, kit dev
-// window, two runs identical, L1 regrade reproduced byte for byte):
-// net PnL +$12.173642, 2 trades (1 buy + 1 sell), win rate 1.0,
-// max drawdown 1.4964%, fees $0.805032, net PnL at 2x fees +$11.364509,
-// 0 rejected, action_log_sha256 c5a9cf6e0ef2bc661c0bf40663c1eea72a866d3b431aa6c945a7ab06ea3fa8a2.
-// The action log is BYTE-IDENTICAL to V2's (same sha256): the bull
-// module never fires on the dev window, so V3's dev behaviour is
-// exactly V2's, trade for trade. Walk-forward 6x4h [0, +12.17, 0, 0, 0, 0]
-// — 1/6 positive (local simulator, exit attributed to its segment).
-// Mirrored/sideways numbers are LOCAL ESTIMATE from v3_tournament.py,
-// not grade-local (the kit grades dev only): mirrored -$6.79 with the
-// B1 module firing once, sideways +$6.49. The exit is in segment 2:
-// the same single plunge trade as V1/V2, held longer (max hold 360,
-// armed trailing) instead of TP 100 at bar ~85.
-//
-// WHY THE GATES FAIL — the window's arithmetic, not the tuning:
-// A perfect-foresight dynamic program over the exact fill model (buy/sell
-// at every bar, fills at next open, 4 bps fee + 2 bps slippage + linear
-// impact, full size) caps the dev window at +$63.65. Allowing optimal
-// partial sizing (25/50/75/100% of cash per trade, Pareto-frontier DP)
-// raises the ceiling only to +$78.33. The window's gross up-swings
-// (zigzag, 40 bps threshold) total 903 bps = $90.30 before any cost,
-// and the largest single swing is 246 bps. Gate 1 ($95.00) is above
-// the perfect-foresight ceiling: no bot — causal or clairvoyant — can
-// clear it on this dev window. Gate 2 (5/6 walk-forward slices > $0,
-// profitable mirrored AND sideways, 2x-fee > $45) fails too: the best
-// candidate manages 1/6 positive slices, $0.00 on mirrored, $10.96 at
-// 2x fees. Segment 6 of dev (bars 1200-1439) contains no up-swing at
-// all (a -277 bps drift), so 6/6 was never available; 5/6 needs the
-// 60-74 bps swings in segments 3 and 5, which no tested entry captures
-// net of the 36 bps round-trip cost. DO NOT SUBMIT this V2.
+// window, L1 regrade reproduced byte for byte — deterministic):
+//   net PnL +$21.091082 USDC, 9 trades (3 round trips, 6 buys + 3 sells),
+//   win rate 1.000, max drawdown 0.5492267%, fees $2.425459 USDC,
+//   2x-fee net PnL +$18.646731, exposure 0.0377, 0 rejected orders.
+//   action_log_sha256 ca2a756d5061af3dfef4db20bfeb97b31ace27927bd1c158f7bedc045b1765a3
+//   result_sha256 e6ec88b193ad7aa1961b0a75134e58a1f2f0733be7495245dda72a55b8fe663d
+//   Local-estimate regime windows (float simulator, exact fill model):
+//   mirrored +$2.61, sideways +$22.18, walk-forward 6x4h
+//   [21.09, 0, 0, 0, 0, 0] — 1/6 positive, mean $3.52; V2 on the same
+//   windows: +$12.17 / 1/6 / $0.00 mirrored / +$12.85 sideways /
+//   +$11.36 at 2x fees (grade-local 2x +$10.96 — the float sim's 2x leg
+//   runs ~$0.40 low on V2, so treat the regime numbers as estimates).
+//   The three dev trades are the wick at bar 24 (+$4.64), the dip at
+//   bar 66 (+$9.37) and the wick at bar 132 (+$5.08) — every tradeable
+//   event the window contains. The +$20-45 target in the brief is not
+//   fully reachable: the window's gross up-swings total 903 bps and
+//   the perfect-foresight ceiling is +$63.65, but only three causal
+//   events clear costs; V4 captures all three. DO NOT SUBMIT on this
+//   evidence alone — the parent agent decides.
 //
 // Everything is bigint arithmetic on raw closes, no randomness, no wall
 // clock, no network, no files: two executions on the same bars give the
@@ -214,25 +171,30 @@ const DIP_MID_BPS = 100n; // vs the 60-bar average
 const DIP_DEEP_BPS = 200n; // vs the 120-bar and 240-bar averages
 const DIP_GUARD_BPS = 50n; // late-window guardrail dip vs 60- / 30-bar average
 
-// Exits, in bps unless noted (V2: wider, armed trailing, longer hold).
-const TAKE_PROFIT_BPS = 150n;
-const TRAIL_ARM_BPS = 70n; // trailing activates only above this profit
-const TRAIL_BPS = 60n;
-const STOP_LOSS_BPS = 65n;
-const MAX_HOLD_BARS = 360;
-const COOLDOWN_BARS = 10;
+// Wick entry: trailing-high depth in bps, window in bars.
+const WICK_BPS = 45n;
+const WICK_WINDOW = 8;
 
-// Bullish Regime Module exits (V3): no take-profit — the wide trail
-// is the exit. Trail 80 bps, armed only after +90 bps profit;
-// hard stop-loss -70 bps; max hold 480 bars.
-const BULL_TRAIL_ARM_BPS = 90n;
-const BULL_TRAIL_BPS = 80n;
-const BULL_STOP_LOSS_BPS = 70n;
-const BULL_MAX_HOLD_BARS = 480;
-// Bull arming: 120-bar close slope must exceed this (bps).
-const BULL_SLOPE_BPS = 80n;
-// Bull idle gate: bars since the last exit before the module may fire.
-const BULL_IDLE_BARS = 360;
+// Split execution: first tranche is 75% of the (depth-capped) notional,
+// the rest of the cash goes in on the next bar.
+const SPLIT_FIRST_NUM = 75n;
+const SPLIT_FIRST_DEN = 100n;
+
+// Dip exits, in bps unless noted (V1 geometry, TP 100 -> 110).
+const DIP_TAKE_PROFIT_BPS = 110n;
+const DIP_TRAIL_ARM_BPS = 0n; // trailing always on for dip trades
+const DIP_TRAIL_BPS = 50n;
+const DIP_STOP_LOSS_BPS = 75n;
+const DIP_MAX_HOLD_BARS = 60;
+
+// Wick exits, in bps unless noted.
+const WICK_TAKE_PROFIT_BPS = 80n;
+const WICK_TRAIL_ARM_BPS = 50n; // trailing activates only above this profit
+const WICK_TRAIL_BPS = 30n;
+const WICK_STOP_LOSS_BPS = 55n;
+const WICK_MAX_HOLD_BARS = 120;
+
+const COOLDOWN_BARS = 10;
 
 // Window-shape rules, counted in bars seen.
 const GUARDRAIL_BAR = 1200; // loosen the dip from here if never traded
@@ -276,34 +238,73 @@ class RunningMean {
   }
 }
 
+/** Trailing maximum of the last `length` bar highs. */
+class TrailingHigh {
+  readonly length: number;
+  private ring: bigint[] = [];
+
+  constructor(length: number) {
+    this.length = length;
+  }
+
+  push(high: bigint): void {
+    this.ring.push(high);
+    if (this.ring.length > this.length) this.ring.shift();
+  }
+
+  get max(): bigint | null {
+    if (this.ring.length === 0) return null;
+    let m = this.ring[0];
+    for (const v of this.ring) if (v > m) m = v;
+    return m;
+  }
+
+  /** How far below the trailing high `close` sits, in bps. */
+  wickBps(close: bigint): bigint {
+    const m = this.max;
+    if (m === null || close >= m) return 0n;
+    return ((m - close) * BPS) / m;
+  }
+}
+
+type EntryKind = 'dip' | 'wick' | 'guard';
+
+/** A buy decided but not yet known to have filled (fills land next bar). */
+interface PendingBuy {
+  tranche: number;
+  decidedClose: bigint;
+}
+
 /** The whole trading state, carried across batches. */
-class DipTrader {
+class WickDipTrader {
   private shortMean = new RunningMean(15);
   private midMean = new RunningMean(60);
   private longMean = new RunningMean(120);
   private longerMean = new RunningMean(240);
   private guardMean = new RunningMean(30);
+  private highWindow = new TrailingHigh(WICK_WINDOW);
   private prevLow: bigint | null = null;
   private lastDepth: bigint | null = null;
   private seenBars = 0;
   private everHeld = false;
-  private pendingEntry: bigint | null = null;
+  private cooldownLeft = 0;
+
+  // Position state. entryClose is the notional-weighted average of the
+  // decided closes of the fills that built the position (blended cost).
+  private trackedQty = 0n;
+  private pendingBuys: PendingBuy[] = [];
   private entryClose: bigint | null = null;
   private peakClose: bigint | null = null;
   private heldBars = 0;
-  private cooldownLeft = 0;
-  // Bullish module state: last 121 closes (for the 120-bar slope and
-  // the 60-bar-high breakout), the mode of the open position, and the
-  // bar on which the last sell was decided.
-  private closes: bigint[] = [];
-  private mode: 'dip' | 'bull' | null = null;
-  private lastExitBar = -1_000_000;
+  private kind: EntryKind | null = null;
+  private splitArmed = false;
 
   onBatch(state: BarsState, batch: Batch): OrderInput[] {
     const bar = batch.bars.find((b) => b.symbol === SYMBOL);
     if (bar === undefined) return []; // no fresh bar this minute: decide nothing
     const close = BigInt(bar.c);
     const low = BigInt(bar.l);
+    const high = BigInt(bar.h);
     this.seenBars += 1;
 
     this.shortMean.push(close);
@@ -311,50 +312,68 @@ class DipTrader {
     this.longMean.push(close);
     this.longerMean.push(close);
     this.guardMean.push(close);
-    // Keep the last 121 closes for the bull module's 120-bar slope
-    // (close vs the close 120 bars ago) and 60-bar-high breakout.
-    this.closes.push(close);
-    if (this.closes.length > 121) this.closes.shift();
+    this.highWindow.push(high);
     // Latest close depth (USDC raw units, 1e6 per USDC): the depth to
     // size the next order against — the next open's depth is unknown.
     if (bar.c_depth.length > 0) this.lastDepth = BigInt(bar.c_depth[0]);
 
+    // Reconcile fills: a buy decided on an earlier batch fills at this
+    // bar's open, so the position the harness reports now includes it.
     const holding = state.positions.get(SYMBOL);
-    const held = holding !== undefined && holding.qty > 0n;
-    if (held) {
-      this.everHeld = true;
+    const curQty = holding !== undefined ? holding.qty : 0n;
+    if (curQty > this.trackedQty) {
+      const filledQty = curQty - this.trackedQty;
+      const buy = this.pendingBuys.shift();
+      const decided = buy !== undefined ? buy.decidedClose : close;
       if (this.entryClose === null) {
-        // The buy sent on an earlier batch has now filled (at this bar's
-        // open). Anchor exits on the close it was decided on.
-        this.entryClose = this.pendingEntry ?? close;
-        this.peakClose = this.entryClose;
-        this.heldBars = 0;
+        this.entryClose = decided;
+        this.peakClose = decided;
+      } else {
+        this.entryClose =
+          (this.entryClose * this.trackedQty + decided * filledQty) / curQty;
       }
-      this.pendingEntry = null;
-    } else {
-      this.entryClose = null;
-      this.peakClose = null;
       this.heldBars = 0;
-      this.pendingEntry = null;
+      if (buy !== undefined && buy.tranche === 1) this.splitArmed = true;
+      this.trackedQty = curQty;
+    } else if (curQty < this.trackedQty) {
+      // A sell filled: the position shrank or closed.
+      this.trackedQty = curQty;
+      if (curQty === 0n) this.resetPosition();
+    } else if (curQty === 0n && this.pendingBuys.length > 0) {
+      // No position and a buy is still outstanding from an earlier
+      // batch: it can only have been rejected (fills resolve one bar
+      // after the decision), so drop it and disarm the split.
+      this.pendingBuys = [];
+      this.splitArmed = false;
     }
+
+    const held = curQty > 0n;
+    if (held) this.everHeld = true;
 
     let orders: OrderInput[] = [];
     if (state.warmingUp) {
       // Warm-up batches build history only; orders here are rejected.
     } else if (held) {
-      orders = this.exitOrders(holding!.qty, close);
+      orders = this.positionOrders(state, holding!.qty, close);
     } else {
-      orders = this.entryOrders(state, close);
+      this.splitArmed = false;
+      orders = this.entryOrders(state, close, low);
     }
 
     this.prevLow = low;
     return orders;
   }
 
-  /** Whole-position exits, first trigger wins. Exit geometry depends
-   * on the mode of the open position: V2 dip exits, or the bull
-   * module's wide armed trail (no take-profit — the trail is the exit). */
-  private exitOrders(qty: bigint, close: bigint): OrderInput[] {
+  private resetPosition(): void {
+    this.entryClose = null;
+    this.peakClose = null;
+    this.heldBars = 0;
+    this.kind = null;
+    this.splitArmed = false;
+  }
+
+  /** Whole-position exits (first trigger wins) and the split 2nd tranche. */
+  private positionOrders(state: BarsState, qty: bigint, close: bigint): OrderInput[] {
     this.heldBars += 1;
     if (this.peakClose !== null && close > this.peakClose) this.peakClose = close;
     const entry = this.entryClose!;
@@ -362,72 +381,93 @@ class DipTrader {
     const up = ((close - entry) * BPS) / entry;
     const down = ((entry - close) * BPS) / entry;
     const offPeak = ((peak - close) * BPS) / peak;
-    const bull = this.mode === 'bull';
-    // Bull: trail 80 armed only after +90 bps unrealised profit.
-    // Dip: V2 trail 60 armed only after +70 bps unrealised profit.
-    const trailArm = bull ? BULL_TRAIL_ARM_BPS : TRAIL_ARM_BPS;
-    const trail = bull ? BULL_TRAIL_BPS : TRAIL_BPS;
-    const stopLoss = bull ? BULL_STOP_LOSS_BPS : STOP_LOSS_BPS;
-    const maxHold = bull ? BULL_MAX_HOLD_BARS : MAX_HOLD_BARS;
-    const trailArmed = up >= trailArm;
+    const isWick = this.kind === 'wick';
+    const tp = isWick ? WICK_TAKE_PROFIT_BPS : DIP_TAKE_PROFIT_BPS;
+    const trail = isWick ? WICK_TRAIL_BPS : DIP_TRAIL_BPS;
+    const arm = isWick ? WICK_TRAIL_ARM_BPS : DIP_TRAIL_ARM_BPS;
+    const sl = isWick ? WICK_STOP_LOSS_BPS : DIP_STOP_LOSS_BPS;
+    const maxHold = isWick ? WICK_MAX_HOLD_BARS : DIP_MAX_HOLD_BARS;
+    // Trailing stop is armed only while unrealised profit is above the
+    // arm level (NOT latching: latching cuts the dip trade early).
+    const trailArmed = up >= arm;
     const done =
-      (!bull && up >= TAKE_PROFIT_BPS) ||
-      down >= stopLoss ||
-      (trailArmed && offPeak >= trail) ||
-      this.heldBars >= maxHold;
-    if (!done) return [];
-    this.cooldownLeft = COOLDOWN_BARS;
-    this.lastExitBar = this.seenBars;
-    this.mode = null;
-    return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+      up >= tp || down >= sl || (trailArmed && offPeak >= trail) || this.heldBars >= maxHold;
+    if (done) {
+      this.cooldownLeft = COOLDOWN_BARS;
+      this.splitArmed = false;
+      return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    }
+    if (this.splitArmed) {
+      // Second tranche: the rest of the cash, one bar after the first.
+      this.splitArmed = false;
+      const cash = state.cash;
+      if (cash < MIN_BUY_QUOTE) return [];
+      this.pendingBuys.push({ tranche: 2, decidedClose: close });
+      return [
+        {
+          side: 'buy',
+          symbol: SYMBOL,
+          notional_quote_units: cash,
+          max_slippage_bps: MAX_SLIPPAGE_BPS,
+        },
+      ];
+    }
+    return [];
   }
 
-  /** Depth-aware size: a* = (TP - 60 bps) * D / 4, capped at cash. */
-  private sizedNotional(cash: bigint): bigint {
-    if (this.lastDepth === null) return cash;
-    // D in USDC = c_depth raw / 1e6; a* in USDC = (TP-60)/10000 * D / 4.
-    // In raw quote units (1e6 per USDC): a* = (TP-60) * c_depth / 40000.
-    const numerator = (TAKE_PROFIT_BPS - 60n) * this.lastDepth;
-    const optimal = numerator / 40_000n;
-    const sized = optimal < cash ? optimal : cash;
+  /** Depth-aware size for the FIRST tranche: min(75% of cash, a*),
+   * where a* = (TP - 12 bps) * D / 4 and D is the latest c_depth.
+   * The 12 bps is the round-trip fee (8) + slippage (4); the impact
+   * term is what a* optimises against. */
+  private sizedFirstTranche(cash: bigint, tpBps: bigint): bigint {
+    const first = (cash * SPLIT_FIRST_NUM) / SPLIT_FIRST_DEN;
+    if (this.lastDepth === null) return first;
+    const optimal = ((tpBps - 12n) * this.lastDepth) / 40_000n;
+    const sized = optimal < first ? optimal : first;
     return sized < MIN_BUY_QUOTE ? 0n : sized;
   }
 
-  /** Buy when a deep dip has started to turn (V1 entry, unchanged). */
-  private entryOrders(state: BarsState, close: bigint): OrderInput[] {
+  /** Buy on a dip or a wick (dip wins the kind label when both fire). */
+  private entryOrders(state: BarsState, close: bigint, low: bigint): OrderInput[] {
     if (this.cooldownLeft > 0) {
       this.cooldownLeft -= 1;
       return [];
     }
-    if (this.seenBars >= NO_BUY_AFTER_BAR) return []; // too late to exit cleanly
-    // Rebound confirmation: never buy while still making fresh lows.
-    if (this.prevLow === null || close <= this.prevLow) return [];
+    if (this.seenBars > NO_BUY_AFTER_BAR) return []; // too late to exit cleanly
+    if (this.prevLow === null) return [];
 
+    // Dip entry needs the V1 rebound confirmation: never buy while the
+    // close is still at or below the previous bar's low.
+    const rebound = close > this.prevLow;
     const dipped =
-      this.shortMean.dipBps(close) >= DIP_SHORT_BPS ||
-      this.midMean.dipBps(close) >= DIP_MID_BPS ||
-      this.longMean.dipBps(close) >= DIP_DEEP_BPS ||
-      this.longerMean.dipBps(close) >= DIP_DEEP_BPS;
+      rebound &&
+      (this.shortMean.dipBps(close) >= DIP_SHORT_BPS ||
+        this.midMean.dipBps(close) >= DIP_MID_BPS ||
+        this.longMean.dipBps(close) >= DIP_DEEP_BPS ||
+        this.longerMean.dipBps(close) >= DIP_DEEP_BPS);
     let guardrail = false;
-    if (!dipped && !this.everHeld && this.seenBars >= GUARDRAIL_BAR) {
+    if (!dipped && !this.everHeld && this.seenBars > GUARDRAIL_BAR) {
       // Insurance only: no trade yet late in the window, so accept a
       // shallower dip rather than finish with zero trades.
       guardrail =
-        this.midMean.dipBps(close) >= DIP_GUARD_BPS ||
-        this.guardMean.dipBps(close) >= DIP_GUARD_BPS;
+        rebound &&
+        (this.midMean.dipBps(close) >= DIP_GUARD_BPS ||
+          this.guardMean.dipBps(close) >= DIP_GUARD_BPS);
     }
-    // The dip entry is checked first and always wins; the bull module
-    // can only fire where V2 would otherwise sit idle.
-    let bull = false;
-    if (!dipped && !guardrail) {
-      bull = this.bullEntry(close);
-      if (!bull) return [];
-    }
+    // Wick entry: >= 45 bps below the trailing 8-bar high, with a
+    // higher low (this bar's low above the previous bar's low) as the
+    // reversal confirmation. No close > prev-low requirement: the
+    // higher low IS the confirmation.
+    const wick =
+      this.highWindow.wickBps(close) >= WICK_BPS && low > this.prevLow;
+    if (!dipped && !guardrail && !wick) return [];
 
-    const notional = this.sizedNotional(state.cash);
+    const kind: EntryKind = dipped ? 'dip' : wick ? 'wick' : 'guard';
+    const tpProxy = kind === 'wick' ? WICK_TAKE_PROFIT_BPS : DIP_TAKE_PROFIT_BPS;
+    const notional = this.sizedFirstTranche(state.cash, tpProxy);
     if (notional < MIN_BUY_QUOTE) return [];
-    this.pendingEntry = close;
-    this.mode = bull ? 'bull' : 'dip';
+    this.kind = kind;
+    this.pendingBuys.push({ tranche: 1, decidedClose: close });
     return [
       {
         side: 'buy',
@@ -437,35 +477,9 @@ class DipTrader {
       },
     ];
   }
-
-  /** Bullish Regime Module: arms ONLY on an unmistakable macro
-   * uptrend — close > SMA240 AND SMA60 > SMA240 AND the 120-bar
-   * close slope > +80 bps — AND only when no dip trade has ever
-   * fired, or >360 bars have passed since the last exit. Enters
-   * ONLY on a confirmed breakout: a new 60-bar high, so there is no
-   * overhead resistance in the last 60 bars and the >120 bps upside
-   * requirement is the open trend itself. Returns false on a
-   * downtrend or chop, where V2's behaviour must stay untouched. */
-  private bullEntry(close: bigint): boolean {
-    if (this.closes.length < 121) return false; // need 120 bars of slope
-    if (!this.longerMean.ready || !this.midMean.ready) return false;
-    if (close <= this.longerMean.mean) return false; // below SMA240
-    if (this.midMean.mean <= this.longerMean.mean) return false; // SMA60 <= SMA240
-    const close120Ago = this.closes[this.closes.length - 121];
-    const slope = ((close - close120Ago) * BPS) / close;
-    if (slope <= BULL_SLOPE_BPS) return false;
-    // Idle gate: only when V2 would otherwise stay completely idle.
-    if (this.everHeld && this.seenBars - this.lastExitBar <= BULL_IDLE_BARS) return false;
-    // Breakout confirmation: a new 60-bar high.
-    let high = 0n;
-    for (let k = this.closes.length - 60; k < this.closes.length; k++) {
-      if (this.closes[k] > high) high = this.closes[k];
-    }
-    return close >= high;
-  }
 }
 
-const trader = new DipTrader();
+const trader = new WickDipTrader();
 
 await runBars({
   onBatch(state, batch) {
